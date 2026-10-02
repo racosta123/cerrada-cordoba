@@ -25,6 +25,8 @@
 
 // Lógica de Shelly Cloud (selector Gen1/Gen2+, llamada, triggerShelly) en módulo aparte.
 import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-core.js';
+// Módulo "Dispositivos" (cambiar un Shelly desde la app): lógica pura aparte, igual que shelly-core.
+import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, criterioAutoritativo, HISTORIAL_MAX } from './dispositivos-core.js';
 
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
 // público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
@@ -92,6 +94,7 @@ export default {
         case '/finanzas/corregir': out = await corregirFinanza(req, env); break;
         case '/finanzas/reactivar': out = await reactivarFinanza(req, env); break;
         case '/finanzas/estado-cuenta': out = await estadoCuentaFinanzas(req, env); break;
+        case '/cobranza/aviso-pago':     out = await avisoPagoCasa(req, env); break;
         case '/config/cobranza':            out = await obtenerConfigCobranza(req, env); break;
         case '/config/cobranza-actualizar': out = await actualizarConfigCobranza(req, env); break;
         case '/vecinos/crear':     out = await crearVecino(req, env); break;
@@ -114,6 +117,17 @@ export default {
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
         case '/personas/alerta-revisar': out = await revisarAlertaFamiliar(req, env); break;
+        case '/personas/pendientes':     out = await pendientesPersonas(req, env); break;
+        case '/personas/alta-cancelar':  out = await cancelarAlta(req, env); break;
+        case '/personas/duplicado-revisar': out = await revisarDuplicadoPersona(req, env); break;
+        case '/personas/baja':           out = await darDeBajaPersona(req, env); break;
+        case '/dispositivos/listar':     out = await listarDispositivos(req, env); break;
+        case '/dispositivos/estado':     out = await estadoDispositivo(req, env); break;
+        case '/dispositivos/verificar':  out = await verificarDispositivo(req, env); break;
+        case '/dispositivos/disponibles': out = await disponiblesDispositivos(req, env); break;
+        case '/dispositivos/cambiar':    out = await cambiarDispositivo(req, env); break;
+        case '/dispositivos/revertir':   out = await revertirDispositivo(req, env); break;
+        case '/dispositivos/probar':     out = await probarDispositivo(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
@@ -124,6 +138,7 @@ export default {
         case '/votaciones/historial':     out = await historialVotaciones(req, env); break;
         case '/votaciones/participantes':  out = await participantesVotacion(req, env); break;
         case '/admin/probar-suspension-automatica': out = await probarSuspensionAutomatica(req, env); break;
+        case '/admin/simular-recordatorio-pago': out = await simularRecordatorioPago(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -137,6 +152,8 @@ export default {
   // evita que el Worker se corte antes de terminar el recorrido de personas/finanzas.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(aplicarSuspensionAutomatica(env));
+    // Recordatorio push (días 1 y 3). Aparte y con su propio try/catch: nunca afecta la suspensión.
+    ctx.waitUntil(enviarRecordatoriosPago(env));
   },
 };
 
@@ -156,7 +173,7 @@ async function abrir(req, env) {
     if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
-  await triggerShelly(env, puerta);
+  await triggerShelly(env, puerta, await mapaDispositivos(env));
 
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
   if (perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
@@ -289,7 +306,7 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
   // se deshace para ESTA petición, así un acceso fallido nunca quema un uso ni deja una
   // entrada/salida fantasma. El error original se relanza intacto (mismo contrato).
   try {
-    await triggerShelly(env, reader.puerta);
+    await triggerShelly(env, reader.puerta, await mapaDispositivos(env));
   } catch (e) {
     await devolverReservaInvitacion(env, inv, reader.direccion === 'entrada' && inv.usosRestantes !== null);
     throw e;
@@ -1323,7 +1340,7 @@ async function crearInvitacionFamiliar(req, env) {
   if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
 
   // Límite de 5 familiares VIVOS (los suspendidos ocupan slot).
-  if (all.filter(p => p.jefeId === jefe.id).length >= 5) throw httpErr(409, 'Ya alcanzaste el máximo de 5 familiares');
+  if (all.filter(p => p.jefeId === jefe.id && !esBaja(p)).length >= 5) throw httpErr(409, 'Ya alcanzaste el máximo de 5 familiares');
 
   const fid = crypto.randomUUID();
   await firestoreSet(env, `personas/${fid}`, {
@@ -1680,12 +1697,15 @@ function domicilioDe(p, byId) {
   if (p.jefeId) { const j = byId[p.jefeId]; return j ? (j.domicilio || '') : ''; }
   return p.domicilio || '';
 }
-function esJefe(p) { return p.rol === 'residente' && !p.jefeId; }
+/* BAJA (venta de casa, mudanza): la persona queda en el padrón solo para auditoría. Una baja ya no
+   cuenta como casa (cobranza, cupo, anti-duplicado de domicilio: el domicilio queda libre). */
+const esBaja = p => !!p && p.estado === 'baja';
+function esJefe(p) { return p.rol === 'residente' && !p.jefeId && !esBaja(p); }
 
 /* Proyecta la persona a usuarios/{uid} (solo si tiene cuenta) para reglas/getPerfil/abrir.
    updateMask para NO borrar el fcmToken que escribe el cliente. */
 async function syncUsuarioIndex(env, at, persona, byId) {
-  if (!persona || !persona.uid) return;
+  if (!persona || !persona.uid || esBaja(persona)) return;
   const fields = {
     nombre:{stringValue: persona.nombre || ''},
     rol:{stringValue: persona.rol || 'residente'},
@@ -1716,7 +1736,7 @@ async function crearPersona(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo staff da de alta personas');
 
-  const { nombre, telefono, domicilio, rol } = await req.json();
+  const { nombre, telefono, domicilio, rol, confirmarDuplicado } = await req.json();
   const nom = String(nombre || '').trim().slice(0, 80);
   const tel = String(telefono || '').trim().slice(0, 30);
   if (!nom) throw httpErr(400, 'Falta el nombre');
@@ -1734,6 +1754,15 @@ async function crearPersona(req, env) {
     if (jefes.some(j => j.domicilioNorm === domNorm)) throw httpErr(409, `Ya existe una casa con el domicilio "${dom}"`);
   }
 
+  // Mismo teléfono o mismo nombre completo que alguien del padrón: NO bloquea. Sin confirmación
+  // explícita responde 409 con la lista para que el staff decida; con confirmación crea el alta
+  // MARCADA (roja en Gestión) para que el comité la revise. Solo marca, nunca impide.
+  const todas = await personasList(env);
+  const dup = duplicadosAlta(nom, tel, todas);
+  if (dup.length && confirmarDuplicado !== true) {
+    return json({ error: 'Ya existe ' + dup.map(d => d.texto).join('; '), requiereConfirmacion: true, duplicados: dup.map(d => d.texto) }, 409);
+  }
+
   const id = crypto.randomUUID();
   await firestoreSet(env, `personas/${id}`, {
     nombre:{stringValue:nom},
@@ -1749,8 +1778,33 @@ async function crearPersona(req, env) {
     suspendidoPor:{nullValue:null},
     creadoPor:{stringValue:user.uid},
     creadoEn:{timestampValue:new Date().toISOString()},
+    dadoDeAltaNombre:{stringValue: perfil.nombre || ''},
+    ...(dup.length ? {
+      duplicadoEstado:{stringValue:'activa'},
+      duplicadoCon:{stringValue: dup.map(d => d.texto).join('; ').slice(0, 300)},
+    } : {}),
   });
-  return json({ ok:true, id });
+  if (dup.length) {
+    await pushStaff(env, '⚠️ Alta duplicada · Cerrada Córdoba',
+      `${nom}${dom ? ' (' + dom + ')' : ''} dada de alta por ${perfil.nombre || 'staff'}: coincide con ${dup.map(d => d.texto).join('; ')}`);
+  }
+  return json({ ok:true, id, duplicado: dup.length > 0 });
+}
+
+/* Coincidencias de un alta con el padrón: mismo teléfono (últimos 10 dígitos) o mismo nombre
+   completo (sin acentos/mayúsculas/espacios extra). Cualquier rol cuenta. */
+function duplicadosAlta(nombre, telefono, all) {
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const tel = normTel(telefono), nom = normNombre(nombre);
+  const out = [];
+  for (const p of all) {
+    const porTel = !!tel && normTel(p.telefono) === tel;
+    const porNombre = !!nom && normNombre(p.nombre) === nom;
+    if (!porTel && !porNombre) continue;
+    const dom = domicilioDe(p, byId);
+    out.push({ id: p.id, motivo: porTel ? 'telefono' : 'nombre', texto: `${p.nombre}${dom ? ' · ' + dom : ''}` });
+  }
+  return out;
 }
 
 /* /personas/actualizar — SOLO staff. Edita nombre/teléfono/domicilio. El familiar no
@@ -1766,6 +1820,7 @@ async function actualizarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(p => byId[p.id] = p);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: solo consulta.');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede editar a un administrador');
 
   const fields = {};
@@ -1834,6 +1889,7 @@ async function suspenderPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: no se suspende.');
   if (p.rol === 'master') throw httpErr(403, 'No se puede suspender un master');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede suspender a un administrador');
 
@@ -1861,6 +1917,7 @@ async function reactivarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: no se reactiva.');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede reactivar a un administrador');
   if (p.jefeId) {
     const jefe = byId[p.jefeId];
@@ -1891,6 +1948,7 @@ async function borrarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: se conserva para auditoría (pagos e historial).');
   if (p.rol === 'master') throw httpErr(403, 'No se puede borrar un master');
 
   if (esJefe(p)) {
@@ -1984,9 +2042,437 @@ async function listarPersonas(req, env) {
     registrado: !!p.uid,
     esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión
     dadoDeAltaNombre: p.dadoDeAltaNombre || '',   // v13: quién dio de alta al familiar
+    duplicadoEstado: p.duplicadoEstado ?? null,   // 'activa' = alta con teléfono/nombre repetido, pendiente de revisar
+    duplicadoCon: p.duplicadoCon ?? null,
+    bajaMotivo: p.bajaMotivo ?? null, bajaEn: p.bajaEn ?? null, bajaNombre: p.bajaNombre ?? null,
   }));
   const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });
+}
+
+/* ---- Altas PENDIENTES de activar (persona dada de alta que aún no crea su cuenta) ----
+   /personas/pendientes — SOLO staff. Personas sin uid y sin jefeId (los familiares los invita y
+   cancela su jefe). Para cada una: quién la dio de alta, cuándo y el estado de su liga de
+   registro (viva con vencimiento / vencida / sin liga). Todo se resuelve en el servidor. */
+async function pendientesPersonas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta altas pendientes');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const nombrePorUid = {}; all.forEach(p => { if (p.uid) nombrePorUid[p.uid] = p.nombre || ''; });
+  const invs = (await firestoreList(env, 'registro_invitaciones')).map(d => readDoc(d.fields)).filter(Boolean);
+  const ahora = Date.now();
+
+  const pendientes = all.filter(p => !p.uid && !p.jefeId && p.rol !== 'master' && !esBaja(p)).map(p => {
+    const mias = invs.filter(i => i.personaId === p.id && !i.usado);
+    const viva = mias.filter(i => i.expiraEn && new Date(i.expiraEn).getTime() > ahora)
+      .sort((a, b) => String(b.expiraEn).localeCompare(String(a.expiraEn)))[0];
+    const liga = viva ? { estado: 'viva', expiraEn: viva.expiraEn }
+      : mias.length ? { estado: 'vencida', expiraEn: mias.map(i => i.expiraEn).sort().pop() || null }
+      : { estado: 'sin-liga', expiraEn: null };
+    return {
+      id: p.id, nombre: p.nombre || '', rol: p.rol || 'residente', estado: p.estado || 'activo',
+      domicilio: domicilioDe(p, byId),
+      creadoPorNombre: p.dadoDeAltaNombre || nombrePorUid[p.creadoPor] || '',
+      creadoEn: p.creadoEn || null,
+      liga,
+      duplicadoEstado: p.duplicadoEstado ?? null,
+    };
+  }).sort((a, b) => String(b.creadoEn || '').localeCompare(String(a.creadoEn || '')));
+  return json({ pendientes });
+}
+
+/* /personas/alta-cancelar — CUALQUIER staff. Cancela un alta que nunca se activó: la persona NO
+   tiene cuenta (uid null), ni familiares, ni pagos de su casa. Borra la persona y sus ligas sin
+   usar, deja respaldo en personas_borradas y registro en la bitácora (quién, cuándo, a quién).
+   Un admin (rol) solo lo cancela el master, igual que su alta. /personas/borrar sigue siendo
+   exclusivo de master y es el único camino para personas con cuenta. */
+async function cancelarAlta(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff cancela altas');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede cancelar un master');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: se conserva para auditoría');
+  if (p.uid) throw httpErr(409, 'Esta persona ya tiene cuenta: no es un alta pendiente');
+  if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master cancela el alta de un administrador');
+  const nFam = all.filter(x => x.jefeId === id).length;
+  if (nFam) throw httpErr(409, `Tiene ${nFam} familiar(es) asociados: no se puede cancelar el alta`);
+  if (esJefe(p)) {
+    // Incluye movimientos CANCELADOS a propósito: un recibo cancelado sigue amarrado a su casa.
+    const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
+    if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
+      throw httpErr(409, 'Esta casa tiene pagos registrados: no se puede cancelar el alta.');
+    }
+  }
+
+  const rGet = await fetch(`${fsBase(env)}/personas/${id}`, { headers:{ Authorization:'Bearer '+at } });
+  const doc = rGet.ok ? await rGet.json() : null;
+  await firestoreSet(env, `personas_borradas/${id}`, {
+    ...(doc?.fields || {}),
+    borradoPor:{stringValue:user.uid}, borradoNombre:{stringValue:perfil.nombre||''}, borradoTs:{timestampValue:new Date().toISOString()},
+    motivoBorrado:{stringValue:'alta-cancelada'},
+  }, at);
+  for (const iv of (await firestoreList(env, 'registro_invitaciones')).filter(d => { const x = readDoc(d.fields); return x.personaId === id && !x.usado; })) {
+    await fetch(`${fsBase(env)}/registro_invitaciones/${iv.name.split('/').pop()}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+  }
+  const rDel = await fetch(`${fsBase(env)}/personas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  if (!rDel.ok) throw httpErr(500, 'No se pudo cancelar el alta');
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} canceló el alta de ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  return json({ ok:true, id });
+}
+
+/* /personas/duplicado-revisar — SOLO staff. "Revisado, es correcto" sobre un alta marcada por
+   teléfono/nombre repetido (mismo criterio que las alertas de familiares): quita lo rojo, deja
+   quién y cuándo en el registro y en la bitácora. No borra ni bloquea nada. */
+async function revisarDuplicadoPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff revisa altas duplicadas');
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const doc = await getDoc(env, at, `personas/${id}`);
+  const p = doc && readDoc(doc.fields);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.duplicadoEstado !== 'activa') throw httpErr(409, 'Esa alta no está marcada');
+  await firestoreActualizarCampos(env, `personas/${id}`, {
+    duplicadoEstado:{stringValue:'revisada'},
+    duplicadoRevisadoPor:{stringValue:user.uid},
+    duplicadoRevisadoNombre:{stringValue:perfil.nombre || ''},
+    duplicadoRevisadoEn:{timestampValue:new Date().toISOString()},
+  }, 'Persona');
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} revisó el alta duplicada de ${p.nombre}: es correcto` });
+  return json({ ok:true, id });
+}
+
+/* /personas/baja — SOLO MASTER (como /personas/borrar). "Dar de baja" a una persona real que sale
+   (venta de casa, mudanza) sin perder su historia. Si es jefe, la baja alcanza a TODA su familia.
+   Para cada persona dada de baja:
+     1) Auth: se DESHABILITA la cuenta (no puede volver a entrar). Si falla, se aborta ANTES de tocar
+        Firestore, como /personas/borrar.
+     2) Puertas: se elimina su índice usuarios/{uid}; /abrir responde "Sin perfil" para TODAS las puertas
+        (incluye peatones y salida) sin tocar /abrir. Sus QR de visita activos se desactivan.
+     3) Sus ligas de registro sin usar se borran.
+     4) personas/{id} queda estado:'baja' con motivo, quién y cuándo. NO se borra: pagos, recibos,
+        finanzas y bitácora siguen intactos y con su nombre para auditoría.
+   Una baja no cuenta como casa (esJefe) ni aparece en listas activas; su domicilio queda libre.
+   No aplica a master, a uno mismo ni a quien ya está de baja. */
+async function darDeBajaPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master da de baja');
+
+  const { id, motivo } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const mot = String(motivo || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+  if (mot.length < 3) throw httpErr(400, 'El motivo de la baja es obligatorio');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede dar de baja a un master');
+  if (p.uid && p.uid === user.uid) throw httpErr(403, 'No puedes darte de baja a ti mismo');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona ya está dada de baja');
+
+  // Objetivos: la persona y, si es jefe, toda su familia que siga viva.
+  const objetivos = [p, ...(p.rol === 'residente' && !p.jefeId ? all.filter(x => x.jefeId === p.id && !esBaja(x)) : [])];
+  if (objetivos.some(t => t.uid && t.uid === user.uid)) throw httpErr(403, 'No puedes darte de baja a ti mismo');
+
+  // 1) Auth primero (todas): si algo falla, Firestore no se ha tocado.
+  for (const t of objetivos) {
+    if (!t.uid) continue;
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:update`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ localId: t.uid, disableUser: true }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      if (!String(err.error?.message || '').includes('USER_NOT_FOUND')) throw httpErr(500, 'No se pudo deshabilitar la cuenta de acceso');
+    }
+  }
+
+  // 2-4) Firestore
+  const ahora = new Date().toISOString();
+  const invisitas = (await firestoreList(env, 'invitaciones')).map(d => ({ id: d.name.split('/').pop(), ...readDoc(d.fields) }));
+  const ligas = (await firestoreList(env, 'registro_invitaciones')).map(d => ({ id: d.name.split('/').pop(), ...readDoc(d.fields) }));
+  for (const t of objetivos) {
+    if (t.uid) {
+      await fetch(`${fsBase(env)}/usuarios/${t.uid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+      for (const v of invisitas.filter(v => v.activa && (v.creadaPor === t.uid || v.hogar === t.uid))) {
+        await firestoreUpdate(env, `invitaciones/${v.id}`, { activa:{ booleanValue:false } }, ['activa']);
+      }
+    }
+    for (const l of ligas.filter(l => l.personaId === t.id && !l.usado)) {
+      await fetch(`${fsBase(env)}/registro_invitaciones/${l.id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+    }
+    await firestoreActualizarCampos(env, `personas/${t.id}`, {
+      estado:{ stringValue:'baja' },
+      bajaMotivo:{ stringValue: mot },
+      bajaPor:{ stringValue: user.uid },
+      bajaNombre:{ stringValue: perfil.nombre || '' },
+      bajaEn:{ timestampValue: ahora },
+      bajaEstadoPrevio:{ stringValue: t.estado || 'activo' },
+      bajaDeJefeId:{ stringValue: t.id === p.id ? '' : p.id },
+    }, 'Persona');
+  }
+  const fam = objetivos.length - 1;
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Master'} dio de baja a ${p.nombre}${domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) ? ' (' + domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) + ')' : ''}${fam ? ' y a ' + fam + ' familiar(es)' : ''}: ${mot}`.slice(0, 500) });
+  return json({ ok:true, id, bajas: objetivos.map(t => t.id) });
+}
+
+/* ===========================================================
+   DISPOSITIVOS — cambiar/revertir el Shelly de una puerta desde la app (SOLO master).
+   config/dispositivos (Firestore; las reglas niegan TODO acceso al cliente, solo este Worker lo lee/escribe)
+   manda sobre el secret SHELLY_DEVICES, que SIGUE siendo el respaldo: si el documento no existe, falla,
+   tarda o viene corrupto, /abrir usa el secret como siempre. SHELLY_HOST y SHELLY_AUTH_KEY no se mueven.
+   =========================================================== */
+const DISP_TTL_MS = 30000;        // un cambio guardado se ve en TODAS las instancias en <= 30 s (en la que lo guarda, al instante)
+const DISP_FALLO_TTL_MS = 15000;  // si la lectura falla, no se reintenta en cada apertura: se usa el secret 15 s
+const DISP_LECTURA_MAX_MS = 1500; // tope DURO que una apertura espera al documento antes de caer al secret
+let DISP_CACHE = { mapa: null, exp: 0 };
+let DISP_VUELO = null;
+function invalidarCacheDispositivos() { DISP_CACHE = { mapa: null, exp: 0 }; DISP_VUELO = null; }
+
+/* Mapa JSON (formato SHELLY_DEVICES) del documento, o null (=> el secret). NUNCA lanza ni demora más de
+   DISP_LECTURA_MAX_MS: la puerta jamás espera ni falla por este módulo. Con caché vigente no hace ninguna lectura. */
+async function mapaDispositivos(env) {
+  const ahora = Date.now();
+  if (ahora < DISP_CACHE.exp) return DISP_CACHE.mapa;
+  try {
+    if (!DISP_VUELO) {
+      DISP_VUELO = (async () => {
+        const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+        const doc = await getDoc(env, at, 'config/dispositivos');
+        return doc ? mapaParaTrigger(parsearDispositivos(readDoc(doc.fields))) : null;
+      })();
+      DISP_VUELO.catch(() => {});
+    }
+    const vuelo = DISP_VUELO;
+    const mapa = await Promise.race([vuelo, new Promise((_, rej) => setTimeout(() => rej(new Error('tope')), DISP_LECTURA_MAX_MS))]);
+    if (DISP_VUELO === vuelo) { DISP_CACHE = { mapa, exp: Date.now() + DISP_TTL_MS }; DISP_VUELO = null; }
+    return mapa;
+  } catch (e) {
+    DISP_VUELO = null;
+    DISP_CACHE = { mapa: null, exp: Date.now() + DISP_FALLO_TTL_MS };
+    return null;
+  }
+}
+
+async function soloMaster(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master administra los dispositivos');
+  return { user, perfil };
+}
+/* Contraseña de nuevo: el cliente reautentica con Firebase y manda un token fresco; aquí se exige que el
+   inicio de sesión (auth_time) sea de hace <= 5 min. Se lee del token YA verificado por requireAuth. */
+function reautenticacionFresca(req) {
+  try {
+    const t = (req.headers.get('Authorization') || '').slice(7);
+    const at = JSON.parse(b64urlToStr(t.split('.')[1])).auth_time;
+    const ahora = Date.now() / 1000;
+    return typeof at === 'number' && ahora - at <= 300 && at <= ahora + 60;
+  } catch (e) { return false; }
+}
+const pideContrasena = () => json({ error: 'Confirma tu contraseña para continuar', requiereContrasena: true }, 403);
+
+async function leerDocDispositivos(env, at) {
+  const doc = await getDoc(env, at, 'config/dispositivos');
+  if (!doc) return { existe: false, updateTime: null, campos: {}, parsed: parsearDispositivos(null) };
+  const campos = readDoc(doc.fields) || {};
+  return { existe: true, updateTime: doc.updateTime, campos, parsed: parsearDispositivos(campos) };
+}
+async function guardarDispositivos(env, at, previo, fields) {
+  const mask = Object.keys(fields).map(f => 'updateMask.fieldPaths=' + encodeURIComponent(f)).join('&');
+  const pre = previo.existe ? 'currentDocument.updateTime=' + encodeURIComponent(previo.updateTime) : 'currentDocument.exists=false';
+  const r = await fetch(`${fsBase(env)}/config/dispositivos?${mask}&${pre}`, {
+    method: 'PATCH', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }),
+  });
+  if (r.status === 409 || r.status === 412) throw httpErr(409, 'Otro cambio se guardó al mismo tiempo: vuelve a intentar');
+  if (!r.ok) throw httpErr(500, 'No se pudo guardar el cambio');
+  invalidarCacheDispositivos();
+}
+const ult6 = id => '…' + String(id || '').slice(-6);
+const idUsadoPorOtra = (parsed, secret, puerta, id) => PUERTAS_DISP.some(p => p !== puerta && (dispositivoEfectivo(parsed, secret, p)?.id || '').toLowerCase() === id.toLowerCase());
+function errorShelly(q) {
+  if (q.error === 'no-existe') return httpErr(404, 'Ese Shelly no existe en tu cuenta de Shelly Cloud');
+  if (q.error === 'formato') return httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  if (q.error) return httpErr(503, 'No se pudo consultar Shelly Cloud, intenta en un minuto');
+  return null;
+}
+
+/* /dispositivos/listar — SOLO master. Sin llamar a Shelly (no gasta el límite de la cuenta). */
+async function listarDispositivos(req, env) {
+  await soloMaster(req, env);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const puertas = PUERTAS_DISP.map(p => {
+    const e = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p);
+    const hist = d.parsed.historial.filter(h => h.puerta === p);
+    const ult = hist[hist.length - 1];
+    return { puerta: p, id: e?.id || null, gen: e?.gen || null, origen: e ? e.origen : 'sin-asignar',
+      cambios: hist.length, ultimoCambio: ult ? { en: ult.en, nombre: ult.nombre, tipo: ult.tipo } : null, puedeRegresar: hist.length > 0 };
+  });
+  return json({ puertas });
+}
+
+/* /dispositivos/estado — SOLO master. UNA puerta por llamada, a petición (cada consulta gasta del límite de Shelly Cloud). */
+const DISP_ESTADO_CACHE = new Map();
+async function estadoDispositivo(req, env) {
+  await soloMaster(req, env);
+  const { puerta } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const e = dispositivoEfectivo((await leerDocDispositivos(env, at)).parsed, env.SHELLY_DEVICES, puerta);
+  if (!e) return json({ ok: true, puerta, asignado: false });
+  const previo = DISP_ESTADO_CACHE.get(puerta);
+  if (previo && Date.now() - previo.at < 10000 && previo.id === e.id) return json({ ...previo.r, cache: true });
+  const q = await consultarShelly(env, e.id);
+  const r = { ok: true, puerta, asignado: true, existe: q.existe, online: q.online, gen: q.gen || e.gen, error: q.error };
+  DISP_ESTADO_CACHE.set(puerta, { at: Date.now(), id: e.id, r });
+  return json(r);
+}
+
+/* /dispositivos/disponibles — SOLO master. MANUAL (una consulta por toque, máx. 1 cada 8 s: gasta del límite de 1 req/s de la
+   cuenta de Shelly). Pide a Shelly Cloud la lista de dispositivos de la cuenta y devuelve SOLO los EN LÍNEA que NO están
+   asignados a ninguna puerta (nombre puesto en la app de Shelly, generación e ID). El frontend nunca recibe la llave de Shelly.
+   diagnostico:true añade la FORMA de la respuesta (campos y tipos, sin valores) para validar el parser contra la nube real. */
+let ULTIMA_LISTA = 0;
+async function disponiblesDispositivos(req, env) {
+  await soloMaster(req, env);
+  const { diagnostico } = await req.json().catch(() => ({}));
+  if (Date.now() - ULTIMA_LISTA < 8000) throw httpErr(429, 'Espera unos segundos antes de buscar de nuevo');
+  ULTIMA_LISTA = Date.now();
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const asignados = new Set(PUERTAS_DISP.map(p => (dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p)?.id || '').toLowerCase()).filter(Boolean));
+  const q = await listarDispositivosCuenta(env);
+  if (!q.ok) {
+    const msg = q.error === 'limite' ? 'Shelly Cloud pide esperar un momento (límite de consultas). Intenta en un minuto.' : 'No se pudo consultar Shelly Cloud, intenta en un minuto.';
+    return json({ error: msg, codigo: q.error, ...(diagnostico === true && q.forma ? { forma: q.forma } : {}) }, 503);
+  }
+  const libres = q.dispositivos.filter(x => idShellyValido(x.id) && !asignados.has(x.id.toLowerCase()));
+  // Un repuesto cuyo "en línea" solo viene de una PISTA (all_status devuelve el último estado conocido) se confirma con la consulta
+  // por dispositivo antes de ofrecerlo. Máx. 4 confirmaciones por toque (cada una gasta del límite de 1 req/s).
+  for (const x of libres.filter(x => !criterioAutoritativo(x.criterioOnline)).slice(0, 4)) {
+    const c = await consultarShelly(env, x.id);
+    if (c.existe) { x.online = c.online; x.criterioOnline = 'v1.status'; if (!x.gen && c.gen) { x.gen = c.gen; x.criterioGen = 'v1.status'; } }
+    else { x.online = false; x.criterioOnline = 'sin-confirmar:' + (c.error || '?'); }
+  }
+  const disponibles = libres.filter(x => x.online).map(x => ({ id: x.id, nombre: x.nombre, gen: x.gen, genEtiqueta: x.genEtiqueta || x.gen, modelo: x.modelo }));
+  const extra = diagnostico !== true ? {} : {
+    forma: q.forma, formaV2: q.formaV2, errorV2: q.errorV2,
+    // TODA la cuenta (solo últimos 6 del ID): a qué puerta está asignado cada uno y con qué criterio se decidió generación y línea
+    cuenta: q.dispositivos.map(x => ({ id6: x.id.slice(-6), nombre: x.nombre, gen: x.gen, genEtiqueta: x.genEtiqueta || x.gen, modelo: x.modelo, online: x.online,
+      criterioGen: x.criterioGen, criterioOnline: x.criterioOnline, criterioNombre: x.criterioNombre || null,
+      asignadoA: PUERTAS_DISP.find(p => (dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p)?.id || '').toLowerCase() === x.id.toLowerCase()) || null })),
+  };
+  return json({ ok: true, disponibles, fueraDeLinea: libres.length - disponibles.length, totalCuenta: q.dispositivos.length, ...extra });
+}
+
+/* /dispositivos/verificar — SOLO master. Valida un ID candidato SIN guardar: formato, existencia, línea y generación. */
+async function verificarDispositivo(req, env) {
+  await soloMaster(req, env);
+  const { id, puerta } = await req.json();
+  const nuevo = String(id || '').trim();
+  if (!idShellyValido(nuevo)) throw httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  if (PUERTAS_DISP.includes(puerta) && idUsadoPorOtra(d.parsed, env.SHELLY_DEVICES, puerta, nuevo)) throw httpErr(409, 'Ese Shelly ya está asignado a otra puerta');
+  const q = await consultarShelly(env, nuevo);
+  const err = errorShelly(q); if (err) throw err;
+  return json({ ok: true, existe: true, online: q.online, gen: q.gen, generacionDetectada: q.gen !== null });
+}
+
+/* Cambia/regresa una puerta: arma el registro, guarda con precondición (updateTime) y deja bitácora. */
+async function aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId, nuevoGen, tipo }) {
+  const actual = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, puerta);
+  const secreto = (() => { try { const e = JSON.parse(env.SHELLY_DEVICES || 'null')?.[puerta]; return typeof e === 'string' ? e : e?.id || null; } catch (x) { return null; } })();
+  const ahora = new Date().toISOString();
+  const hist = d.parsed.historial.concat([{ puerta, idAnterior: actual?.id || null, genAnterior: actual?.gen || null, idNuevo: nuevoId, genNuevo: nuevoGen, en: ahora, por: user.uid, nombre: perfil.nombre || '', tipo }]).slice(-HISTORIAL_MAX);
+  const vuelveAlSecreto = !!secreto && secreto.toLowerCase() === nuevoId.toLowerCase();
+  const fields = {
+    [`${puerta}_id`]: vuelveAlSecreto ? { nullValue: null } : { stringValue: nuevoId },
+    [`${puerta}_gen`]: vuelveAlSecreto ? { nullValue: null } : { integerValue: String(nuevoGen) },
+    [`${puerta}_offSec`]: { nullValue: null },
+    historial: { stringValue: JSON.stringify(hist) },
+    version: { integerValue: String((d.parsed.version || 0) + 1) },
+    actualizadoEn: { timestampValue: ahora },
+    actualizadoPor: { stringValue: user.uid },
+  };
+  await guardarDispositivos(env, at, d, fields);
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Master'} ${tipo === 'regreso' ? 'regresó' : 'cambió'} el Shelly de ${puerta}: ${actual ? ult6(actual.id) + ' (Gen' + actual.gen + ')' : 'sin asignar'} → ${ult6(nuevoId)} (Gen${nuevoGen})` });
+}
+
+/* /dispositivos/cambiar — SOLO master + contraseña reciente. El Shelly nuevo debe existir y estar EN LÍNEA antes de guardar. */
+async function cambiarDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, id, genManual } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const nuevo = String(id || '').trim();
+  if (!idShellyValido(nuevo)) throw httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const actual = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, puerta);
+  if (actual && actual.id.toLowerCase() === nuevo.toLowerCase()) throw httpErr(409, 'Ese ya es el Shelly de esta puerta');
+  if (idUsadoPorOtra(d.parsed, env.SHELLY_DEVICES, puerta, nuevo)) throw httpErr(409, 'Ese Shelly ya está asignado a otra puerta');
+  const q = await consultarShelly(env, nuevo);
+  const err = errorShelly(q); if (err) throw err;
+  if (!q.online) throw httpErr(409, 'El Shelly existe pero está fuera de línea: enciéndelo y conéctalo antes de asignarlo');
+  const gen = q.gen ?? ([1, 2, 3].includes(genManual) ? genManual : null);
+  if (!gen) throw httpErr(409, 'No se pudo detectar la generación: indícala manualmente (Gen1, Gen2 o Gen3)');
+  await aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId: nuevo, nuevoGen: gen, tipo: 'cambio' });
+  return json({ ok: true, puerta, gen });
+}
+
+/* /dispositivos/revertir — SOLO master + contraseña reciente. Un toque: vuelve al Shelly anterior de esa puerta
+   (si el anterior era el del secret, la puerta regresa al secret). Exige que el anterior esté en línea, salvo forzar:true. */
+async function revertirDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, forzar } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const ult = d.parsed.historial.filter(h => h.puerta === puerta).pop();
+  if (!ult || !ult.idAnterior || !idShellyValido(ult.idAnterior)) throw httpErr(409, 'No hay un Shelly anterior para esta puerta');
+  const objetivoGen = [1, 2, 3].includes(ult.genAnterior) ? ult.genAnterior : 1;
+  if (forzar !== true) {
+    const q = await consultarShelly(env, ult.idAnterior);
+    const err = errorShelly(q); if (err) throw err;
+    if (!q.online) return json({ error: 'El Shelly anterior está fuera de línea. Si aun así quieres regresar, confirma.', anteriorFueraDeLinea: true }, 409);
+  }
+  await aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId: ult.idAnterior, nuevoGen: objetivoGen, tipo: 'regreso' });
+  return json({ ok: true, puerta });
+}
+
+/* /dispositivos/probar — SOLO master + contraseña reciente + confirmar:true. ABRE LA PUERTA FÍSICA por la ruta normal
+   (portero y todo), para comprobar el Shelly recién asignado. Máximo una prueba cada 10 s. */
+let ULTIMA_PRUEBA = 0;
+async function probarDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, confirmar } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  if (confirmar !== true) throw httpErr(400, 'Falta la confirmación explícita: el pulso ABRE la puerta');
+  if (Date.now() - ULTIMA_PRUEBA < 10000) throw httpErr(429, 'Espera unos segundos entre pulsos de prueba');
+  ULTIMA_PRUEBA = Date.now();
+  await triggerShelly(env, puerta, await mapaDispositivos(env));
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Master'} hizo un pulso de prueba en ${puerta}` });
+  return json({ ok: true, puerta });
 }
 
 /* /personas/mis-familiares — el JEFE lista SOLO a su propia familia (self-service:
@@ -1997,7 +2483,7 @@ async function misFamiliares(req, env) {
   const all = await personasList(env);
   const jefe = all.find(p => p.uid === user.uid);
   if (!jefe || !esJefe(jefe)) throw httpErr(403, 'Solo un jefe de familia tiene familiares');
-  const familiares = all.filter(p => p.jefeId === jefe.id)
+  const familiares = all.filter(p => p.jefeId === jefe.id && !esBaja(p))
     .map(f => ({
       id: f.id, nombre: f.nombre || '', telefono: f.telefono || '',
       estado: f.estado || 'activo', registrado: !!f.uid, suspendidoPor: f.suspendidoPor ?? null,
@@ -2171,12 +2657,11 @@ async function estadoCuentaFinanzas(req, env) {
    mes de "hoy" aún no alcanza al de fechaEfectiva, ese mes en curso no cuenta como completo).
    Si fechaEfectiva cae en el futuro, meses da negativo y se recorta a 0 (nunca error, nunca
    adeudo negativo). */
-function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
+function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa, ahora = ahoraHermosillo() }) {
   const inicioCobro = new Date(cfg.fechaInicioCobro);
   const alta = altaCasa ? new Date(altaCasa) : inicioCobro;
   const fechaEfectiva = (alta instanceof Date && !isNaN(alta) && alta > inicioCobro) ? alta : inicioCobro;
 
-  const ahora = ahoraHermosillo();
   const fechaEfectivaHermosillo = aHermosillo(fechaEfectiva);
   let meses = (ahora.getUTCFullYear() - fechaEfectivaHermosillo.getUTCFullYear()) * 12
             + (ahora.getUTCMonth() - fechaEfectivaHermosillo.getUTCMonth());
@@ -2217,6 +2702,39 @@ function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
    reservado (ver comentario junto a suspenderPersona) que distingue esta suspensión
    automática de una manual de staff. Una suspensión manual (motivoSuspension ausente)
    jamás se toca aquí: solo se suspende a quien está 'activo' hoy. */
+/* Núcleo ÚNICO de "quién debe": jefes ACTIVOS con adeudo > 0. Lo usan la suspensión automática
+   y el recordatorio de pago (mismo criterio, sin duplicar el cálculo). Solo lee. `ahora` es
+   opcional (hora Hermosillo, ver calcularEstadoCuenta); sin él, el momento actual. */
+async function casasConAdeudo(env, at, cfg, ahora, soloDomNorm) {
+  // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
+  // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
+  const pagosPorCasa = new Map();
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
+    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
+    const dn = normDomicilio(d.casa);
+    if (soloDomNorm && dn !== soloDomNorm) continue;   // consulta de UNA casa: mismo cálculo, menos trabajo
+    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
+    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
+  }
+  const all = await personasList(env, at);
+  const morosas = [];
+  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo' && (!soloDomNorm || p.domicilioNorm === soloDomNorm))) {
+    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm), ...(ahora ? { ahora } : {}) });
+    if (estado.adeudo > 0) morosas.push({ jefe, estado });
+  }
+  return { all, morosas };
+}
+/* Config de cobranza SOLO lectura (no siembra config/cobranza si falta). */
+function cfgCobranzaDesdeDoc(rawCfgDoc) {
+  const raw = rawCfgDoc ? readDoc(rawCfgDoc.fields) : {};
+  return {
+    cuotaMensual: typeof raw.cuotaMensual === 'number' ? raw.cuotaMensual : CUOTA_DEFAULT,
+    fechaInicioCobro: raw.fechaInicioCobro || FECHA_INICIO_COBRO_DEFAULT,
+  };
+}
+
 async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const ahora = ahoraHermosillo();
@@ -2238,31 +2756,12 @@ async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
     // 'simular' NUNCA escribe — ni siquiera sembrar config/cobranza si no existiera todavía.
     // Arma cfg en memoria desde rawCfgDoc (ya leído arriba, un solo GET), con los mismos
     // defaults que usa leerConfigCobranza, pero sin llamarla (esa sí siembra el doc si falta).
-    const raw = rawCfgDoc ? readDoc(rawCfgDoc.fields) : {};
-    cfg = {
-      cuotaMensual: typeof raw.cuotaMensual === 'number' ? raw.cuotaMensual : CUOTA_DEFAULT,
-      fechaInicioCobro: raw.fechaInicioCobro || FECHA_INICIO_COBRO_DEFAULT,
-    };
+    cfg = cfgCobranzaDesdeDoc(rawCfgDoc);
   }
 
-  // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
-  // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
-  const pagosPorCasa = new Map();
-  for (const doc of await firestoreList(env, 'finanzas')) {
-    const d = readDoc(doc.fields);
-    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
-    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
-    const dn = normDomicilio(d.casa);
-    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
-    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
-  }
-
-  const all = await personasList(env, at);
+  const { all, morosas } = await casasConAdeudo(env, at, cfg);
   const suspendidas = [];
-  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo')) {
-    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm) });
-    if (estado.adeudo <= 0) continue;
-
+  for (const { jefe, estado } of morosas) {
     if (modo === 'aplicar') {
       await firestoreActualizarCampos(env, `personas/${jefe.id}`, {
         estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'}, motivoSuspension:{stringValue:'mora'},
@@ -2283,6 +2782,135 @@ async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
     await firestoreActualizarCampos(env, 'config/cobranza', { ultimoMesProcesado:{stringValue:mesActual} }, 'Configuración de cobranza');
   }
   return { ok:true, modo, aplico: modo === 'aplicar', mesActual, ultimoMesProcesado, suspendidas };
+}
+
+/* ============ Recordatorio de pago por push ============
+   Lo dispara el MISMO cron diario (scheduled()); no hay cron nuevo. Día 1 y día 3 del mes
+   (hora Hermosillo) avisa por push SOLO al jefe de las casas que el día 5 serían suspendidas.
+   "Serían suspendidas" = casasConAdeudo (el núcleo de la suspensión automática) evaluado al día 5
+   del mes en curso, así el criterio es idéntico al del corte. Antes de fechaInicioCobro el adeudo
+   es 0 por definición, por lo que nadie recibe nada. Quien está al corriente, suspendido o dado
+   de baja no sale en casasConAdeudo.
+   Una marca por casa y día (recordatorios_pago/{personaId}_{AAAA-MM-DD}, creada con
+   currentDocument.exists=false) evita repetir si el cron corre dos veces. Sin fcmToken no hay nada
+   que enviar ni marca: no falla. Solo el Worker escribe ahí (las reglas niegan todo lo no listado). */
+const MESES_ES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+function textoRecordatorioPago(dia, mesIdx) {
+  if (dia === 1) return `Ya puedes pagar tu cuota de ${MESES_ES[mesIdx]}. Págala antes del día 5 para evitar la suspensión.`;
+  if (dia === 3) return 'Te quedan 2 días para pagar tu cuota y evitar la suspensión del acceso vehicular.';
+  return null;
+}
+function antesDeInicioCobro(cfg, ahora) {
+  return inicioDiaHermosilloUTC(ahora.getUTCFullYear(), ahora.getUTCMonth(), ahora.getUTCDate()).getTime() < Date.parse(cfg.fechaInicioCobro);
+}
+/* `ahora`: Date en marco Hermosillo (como ahoraHermosillo()). Solo lee; arma el plan del día. */
+async function planRecordatoriosPago(env, at, ahora) {
+  const dia = ahora.getUTCDate(), mesIdx = ahora.getUTCMonth(), anio = ahora.getUTCFullYear();
+  const fecha = `${anio}-${String(mesIdx + 1).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+  const texto = textoRecordatorioPago(dia, mesIdx);
+  if (!texto) return { fecha, dia, texto: null, casas: [] };
+  const cfg = cfgCobranzaDesdeDoc(await getDoc(env, at, 'config/cobranza'));
+  // Nunca antes de fechaInicioCobro (además de que el adeudo ya sería 0 por el cálculo común).
+  if (antesDeInicioCobro(cfg, ahora)) return { fecha, dia, texto, casas: [] };
+  const dia5 = new Date(Date.UTC(anio, mesIdx, 5));
+  const { morosas } = await casasConAdeudo(env, at, cfg, dia5);
+  const casas = [];
+  for (const { jefe, estado } of morosas) {
+    const perfil = jefe.uid ? await getPerfil(env, jefe.uid) : null;
+    casas.push({ id: jefe.id, nombre: jefe.nombre, domicilio: jefe.domicilio, uid: jefe.uid || null,
+      adeudo: estado.adeudo, push: !!perfil?.fcmToken, fcmToken: perfil?.fcmToken || null });
+  }
+  return { fecha, dia, texto, casas };
+}
+/* Envío real (cron). Nunca lanza hacia scheduled(): un fallo aquí no debe tumbar la suspensión. */
+async function enviarRecordatoriosPago(env, ahora = ahoraHermosillo()) {
+  const res = { enviados: [], omitidas: [] };
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const plan = await planRecordatoriosPago(env, at, ahora);
+    if (!plan.texto || !plan.casas.length) return { ...res, dia: plan.dia };
+    let atFcm = null;
+    for (const c of plan.casas) {
+      if (!c.push) { res.omitidas.push({ id: c.id, motivo: 'sin-push' }); continue; }
+      const marca = `recordatorios_pago/${c.id}_${plan.fecha}`;
+      const r = await fetch(`${fsBase(env)}:commit`, {
+        method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+        body: JSON.stringify({ writes:[{ update:{ name: docName(env, marca), fields:{
+          personaId:{stringValue:c.id}, fecha:{stringValue:plan.fecha}, dia:{integerValue:String(plan.dia)},
+          ts:{timestampValue:new Date().toISOString()} } }, currentDocument:{ exists:false } }] }),
+      });
+      if (r.status === 409 || r.status === 400) { res.omitidas.push({ id: c.id, motivo: 'ya-enviado' }); continue; }
+      if (!r.ok) { res.omitidas.push({ id: c.id, motivo: 'error-marca' }); continue; }
+      try {
+        atFcm = atFcm || await saToken(env, 'https://www.googleapis.com/auth/firebase.messaging');
+        const p = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/messages:send`, {
+          method:'POST', headers:{ Authorization:'Bearer '+atFcm, 'Content-Type':'application/json' },
+          body: JSON.stringify({ message:{ token:c.fcmToken, notification:{ title:'Cerrada Córdoba', body:plan.texto } } }),
+        });
+        if (!p.ok) throw new Error('fcm ' + p.status);
+        res.enviados.push(c.id);
+      } catch (e) {
+        // No salió: se quita la marca para que un reintento del mismo día sí pueda enviarlo.
+        await fetch(`${fsBase(env)}/${marca}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+        res.omitidas.push({ id: c.id, motivo: 'fallo-envio' });
+      }
+    }
+    return { ...res, dia: plan.dia };
+  } catch (e) {
+    console.error('enviarRecordatoriosPago', e);
+    return res;
+  }
+}
+/* ============ /cobranza/aviso-pago — residente o familiar, SOLO su propia casa ============
+   Solo lectura. Alimenta el aviso amarillo de Puertas en la app (la app NO lo consulta en cada
+   apertura). mostrar:true únicamente del día 1 al 4 (Hermosillo), si la casa sería suspendida el
+   día 5 (casasConAdeudo evaluado al día 5, el mismo núcleo del corte y del push) y nunca antes de
+   fechaInicioCobro. Calcula en cada llamada, así que un pago que salda el adeudo apaga el aviso
+   de inmediato para el jefe y todos sus familiares. La casa sale del perfil del token; si el
+   cuerpo trae otra casa, 403. Nunca se lee otra casa. */
+async function avisoPagoCasa(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'residente' || !perfil.casa) throw httpErr(403, 'Solo residentes con casa');
+  const domNorm = normDomicilio(perfil.casa);
+  const { casa } = await req.json().catch(() => ({}));
+  if (casa !== undefined && casa !== null && casa !== '' && normDomicilio(casa) !== domNorm) throw httpErr(403, 'Solo puedes consultar tu propia casa');
+
+  const ahora = ahoraHermosillo();
+  const dia = ahora.getUTCDate();
+  if (dia < 1 || dia > 4) return json({ ok:true, mostrar:false });
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const cfg = cfgCobranzaDesdeDoc(await getDoc(env, at, 'config/cobranza'));
+  if (antesDeInicioCobro(cfg, ahora)) return json({ ok:true, mostrar:false });
+  const dia5 = new Date(Date.UTC(ahora.getUTCFullYear(), ahora.getUTCMonth(), 5));
+  const { morosas } = await casasConAdeudo(env, at, cfg, dia5, domNorm);
+  if (!morosas.length) return json({ ok:true, mostrar:false });
+  return json({ ok:true, mostrar:true, mes: MESES_ES[ahora.getUTCMonth()] });
+}
+
+/* ============ /admin/simular-recordatorio-pago — SOLO master y admin ============
+   Muestra a qué casas se enviaría y con qué texto. No envía ni escribe nada. `fecha` opcional
+   (AAAA-MM-DD) para ver cómo saldría otro día (p. ej. el 1 del mes que entra); sin ella, hoy. */
+async function simularRecordatorioPago(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || (perfil.rol !== 'master' && perfil.rol !== 'admin')) throw httpErr(403, 'Solo master y admin');
+  const { fecha } = await req.json().catch(() => ({}));
+  let ahora = ahoraHermosillo();
+  if (fecha !== undefined && fecha !== null && fecha !== '') {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(fecha));
+    const d = m && new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    if (!d || isNaN(d) || d.getUTCDate() !== +m[3]) throw httpErr(400, 'fecha inválida (AAAA-MM-DD)');
+    ahora = d;
+  }
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const plan = await planRecordatoriosPago(env, at, ahora);
+  const casas = [];
+  for (const c of plan.casas) {
+    const ya = plan.texto ? !!(await getDoc(env, at, `recordatorios_pago/${c.id}_${plan.fecha}`)) : false;
+    casas.push({ id: c.id, nombre: c.nombre, domicilio: c.domicilio, adeudo: c.adeudo, push: c.push, yaEnviado: ya });
+  }
+  return json({ ok:true, fecha: plan.fecha, dia: plan.dia, texto: plan.texto, casas });
 }
 
 /* Reactivación automática al pagar — la llama registrarFinanza justo después de escribir un

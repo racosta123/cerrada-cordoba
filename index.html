@@ -403,6 +403,8 @@
 
   <!-- TAB: PUERTAS -->
   <div id="tab-doors" class="tabpane">
+    <!-- Aviso de pago (días 1 al 4): lo llena refrescarAvisoPago() en app.js desde /cobranza/aviso-pago -->
+    <div id="avisoPagoBanner" class="vbanner hidden" style="margin:0 0 14px"></div>
     <div class="section-title">Abrir puertas</div>
     <div class="doors" id="doorsGrid"></div>
     <!-- Versión visible para TODOS (mismo estilo y misma fuente que la de Gestión; el diagnóstico
@@ -531,12 +533,24 @@
 
   <!-- TAB: ADMIN (master/admin) — Personas (FASE 6.5): padrón unificado -->
   <div id="tab-admin" class="tabpane hidden">
+    <div id="pendSection" class="hidden">
+      <div class="section-title">Pendientes de activar <span class="tag" id="pendCount">0</span></div>
+      <div class="list" id="pendList"></div>
+    </div>
     <div class="section-title">Personas</div>
     <div class="list">
       <button class="btn-primary" id="newPersonaBtn" style="margin-top:0">Alta de persona</button>
+      <button class="btn-ghost" id="refreshPersonasBtn" style="width:100%;margin-top:8px">↻ Actualizar</button>
     </div>
     <div class="field"><input id="personaSearch" placeholder="Buscar por nombre, domicilio o teléfono…"></div>
+    <div id="personasErr" class="vbanner hidden" style="margin:0 0 10px"></div>
     <div class="list" id="personasList"><div class="empty">Cargando…</div></div>
+
+    <!-- Bajas — SOLO consulta: personas que salieron (venta de casa, mudanza). Sus pagos e historial se conservan. -->
+    <div id="bajasSection" class="hidden">
+      <div class="section-title">Bajas <span class="tag" id="bajasCount">0</span></div>
+      <div class="list" id="bajasList"></div>
+    </div>
 
     <!-- Configuración de cobranza — cuota/fecha: staff (master/admin/jefe-admin). Link de pago: SOLO master (#ccLinkField, oculto al resto) -->
     <div id="cobranzaConfigSection" class="hidden">
@@ -571,10 +585,28 @@
         <button class="btn-primary" id="susSimularBtn" style="margin-top:0;flex:1">Simular (sin cambios)</button>
         <button class="btn-ghost" id="susAplicarBtn" style="color:var(--bad);border-color:rgba(248,113,113,.4)">Aplicar de verdad</button>
       </div>
+      <!-- Recordatorio de pago por push (días 1 y 3) — SOLO master y admin. Nunca envía: solo muestra a quién y qué texto. -->
+      <button class="btn-ghost hidden" id="recSimularBtn" style="width:100%;margin-top:8px">Simular recordatorio (sin enviar)</button>
+      <div id="recResultado" class="list" style="margin-top:10px"></div>
       <div class="vbanner" style="margin:10px 0 0">
         ⚠️ "Aplicar de verdad" suspende personas REALES ahora mismo (bloquea sus puertas) si tienen adeudo — no es una prueba. Usa "Simular" primero para ver a quién afectaría.
       </div>
       <div id="susResultado" class="list" style="margin-top:10px"></div>
+    </div>
+
+    <!-- Dispositivos (Shelly) — SOLO master. Cambiar el Shelly de una puerta sin tocar secrets ni código. -->
+    <div id="dispSection" class="hidden" style="margin-top:22px">
+      <div class="section-title">Dispositivos (Shelly)</div>
+      <p class="vnote" style="margin:0 0 10px">Si un Shelly se quema, conecta el nuevo en Shelly Cloud, pega aquí su ID y asígnalo a la puerta. Antes de guardar se comprueba que exista y esté en línea. Siempre puedes regresar al anterior.</p>
+      <div class="list" id="dispList"><div class="empty">Cargando…</div></div>
+      <button class="btn-ghost" id="dispDiagBtn" style="width:100%;margin-top:10px">🔍 Diagnóstico de Shelly Cloud (solo lectura)</button>
+      <div id="dispDiag" class="vnote hidden" style="margin-top:10px;white-space:pre-wrap;word-break:break-word"></div>
+    </div>
+
+    <div class="section-title" style="margin-top:22px">Compartir app</div>
+    <div class="list">
+      <button class="btn-primary" id="shareAppWaBtn" style="margin-top:0">📲 Compartir app</button>
+      <button class="btn-ghost" id="shareAppCopyBtn" style="width:100%;margin-top:8px">Copiar enlace</button>
     </div>
 
     <div id="appVersion" class="app-version" style="margin:26px 0 4px;text-align:center;color:var(--text);font-size:14px;line-height:1.5"></div>
@@ -629,6 +661,7 @@
     </div>
     <div class="field" id="peDomField"><label>Domicilio</label><input id="peDom" placeholder="Ej. Ajoya 12"></div>
     <p id="peHint" style="font-size:12px;color:var(--muted-2);line-height:1.5;margin:0 0 14px 2px">La cuenta de acceso la crea la propia persona al registrarse con la invitación. Aquí no se captura correo ni contraseña.</p>
+    <div id="peDupWarn" class="vbanner hidden" style="margin:0 0 10px"></div>
     <button class="btn-primary" id="savePersonaBtn">Guardar</button>
     <button class="btn-ghost hidden" id="delPersonaBtn" style="width:100%;margin-top:10px;color:var(--bad);border-color:rgba(248,113,113,.4)">Borrar persona</button>
     <div id="peErr" class="err"></div>
@@ -658,6 +691,48 @@
     <button class="btn-primary" id="personaSuspenderConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Sí, suspender</button>
     <button class="btn-ghost" id="personaSuspenderCancel" style="width:100%;margin-top:10px">Cancelar</button>
     <div id="personaSuspenderErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ DISPOSITIVOS (solo master): cambiar / regresar / pulso de prueba — pide la contraseña de nuevo ============ -->
+<div class="overlay" id="dispOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3 id="dispTitle">Cambiar Shelly</h3>
+    <div class="recibo-datos" id="dispInfo"></div>
+    <div id="dispIdField">
+      <div id="dispLista" class="list" style="margin:0 0 8px"></div>
+      <div id="dispListaMsg" class="vnote" style="margin:0 0 10px"></div>
+      <button class="btn-ghost" id="dispBuscarBtn" style="width:100%;margin:0 0 8px">↻ Buscar repuestos de nuevo</button>
+      <button class="btn-ghost" id="dispManualBtn" style="width:100%;margin:0 0 10px">Escribir el ID a mano</button>
+      <div id="dispSel" class="vnote" style="margin:0 0 10px"></div>
+      <div id="dispManual" class="hidden">
+        <div class="field"><label>ID del Shelly nuevo (Shelly Cloud → Dispositivo → Información)</label><input id="dispId" placeholder="Ej. e8db84d2a4cb" autocapitalize="off" autocomplete="off" spellcheck="false" maxlength="16"></div>
+        <button class="btn-ghost" id="dispValidarBtn" style="width:100%;margin:0 0 10px">Validar (existe y está en línea)</button>
+        <div id="dispValid" class="vnote" style="margin:0 0 10px"></div>
+      </div>
+      <div class="field hidden" id="dispGenField"><label>No se pudo detectar la generación — elige:</label>
+        <select id="dispGen"><option value="">Elegir…</option><option value="1">Gen1</option><option value="2">Gen2</option><option value="3">Gen3</option></select></div>
+    </div>
+    <div class="vbanner hidden" id="dispAviso" style="margin:0 0 12px"></div>
+    <div class="field"><label>Tu contraseña de master (se pide de nuevo)</label><input id="dispPass" type="password" autocomplete="current-password" placeholder="••••••••"></div>
+    <button class="btn-primary" id="dispConfirmBtn">Guardar cambio</button>
+    <button class="btn-ghost" id="dispCancelBtn" style="width:100%;margin-top:10px">Cancelar</button>
+    <div id="dispErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ DAR DE BAJA (solo master) — motivo obligatorio + confirmación en 2 pasos ============ -->
+<div class="overlay" id="personaBajaOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Dar de baja</h3>
+    <div class="recibo-datos" id="personaBajaInfo"></div>
+    <div class="vbanner" style="margin:0 0 12px">Se deshabilita su cuenta, se bloquean TODAS sus puertas y sus invitaciones, y sale de las listas activas (si es jefe, también su familia). Sus pagos, recibos e historial se conservan con su nombre.</div>
+    <div class="field"><label>Motivo (obligatorio)</label><input id="personaBajaMotivo" maxlength="300" placeholder="Ej. Vendió la casa / se mudó"></div>
+    <button class="btn-primary" id="personaBajaConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Dar de baja</button>
+    <button class="btn-ghost" id="personaBajaCancel" style="width:100%;margin-top:10px">Cancelar</button>
+    <div id="personaBajaErr" class="err"></div>
   </div>
 </div>
 
