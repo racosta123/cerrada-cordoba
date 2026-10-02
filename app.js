@@ -103,6 +103,44 @@ function mapAuthError(code){
 
 $('#logoutBtn').addEventListener('click', ()=> auth.signOut());
 
+/* ====================== RECUPERAR CONTRASEÑA ======================
+   Mismo mensaje exista o no el correo (no se puede averiguar quién está registrado) y botón
+   bloqueado 30 s tras cada envío (sin ráfagas). El envío lo hace Firebase Auth en español. */
+const MSG_RECUPERAR = 'Si el correo está registrado, te llegará un enlace. Revisa también Spam.';
+const ESPERA_RECUPERAR = 30;
+let recuperarBloqueado = false;
+function abrirRecuperar(abrir){
+  $('#forgotBox').classList.toggle('hidden', !abrir);
+  $('#forgotBtn').classList.toggle('hidden', abrir);
+  $('#forgotMsg').textContent = '';
+  if (abrir) $('#forgotEmail').value = $('#email').value.trim();
+}
+$('#forgotBtn').addEventListener('click', () => abrirRecuperar(true));
+$('#forgotBack').addEventListener('click', () => abrirRecuperar(false));
+$('#forgotSend').addEventListener('click', async () => {
+  if (recuperarBloqueado) return;
+  const email = $('#forgotEmail').value.trim();
+  const msg = $('#forgotMsg'), btn = $('#forgotSend');
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ msg.textContent = 'Escribe un correo válido.'; return; }
+  recuperarBloqueado = true; btn.disabled = true;
+  try {
+    auth.languageCode = 'es';
+    await auth.sendPasswordResetEmail(email);
+    msg.textContent = MSG_RECUPERAR;
+  } catch(e){
+    if (e && e.code === 'auth/too-many-requests') msg.textContent = 'Demasiados intentos. Espera un momento.';
+    else if (e && e.code === 'auth/network-request-failed') msg.textContent = 'No se pudo enviar. Revisa tu internet e intenta de nuevo.';
+    else msg.textContent = MSG_RECUPERAR;   // correo inexistente u otro error: mismo mensaje
+  }
+  let s = ESPERA_RECUPERAR;
+  btn.textContent = 'Espera ' + s + ' s';
+  const t = setInterval(() => {
+    s--;
+    if (s <= 0){ clearInterval(t); recuperarBloqueado = false; btn.disabled = false; btn.textContent = 'Enviar enlace'; }
+    else btn.textContent = 'Espera ' + s + ' s';
+  }, 1000);
+});
+
 /* ====================== SESIÓN ====================== */
 auth.onAuthStateChanged(async user => {
   if (!user){ showLogin(); return; }
@@ -125,6 +163,7 @@ function showLogin(){
   $('#appView').classList.add('hidden');
   $('#loginView').classList.remove('hidden');
   $('#password').value = '';
+  abrirRecuperar(false);
   $('#loginBtn').disabled = false; $('#loginBtn').textContent = 'Entrar';
   if (unsubLog) unsubLog();
   if (unsubAlertas){ unsubAlertas(); unsubAlertas = null; }
