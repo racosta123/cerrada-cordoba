@@ -7,8 +7,9 @@
 <title>Cerrada Córdoba</title>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<!-- Fondo (letrero Córdoba): precarga solo la variante del viewport para no retrasar el render -->
-<!-- PENDIENTE_CORDOBA_FONDO: al tener assets/fondo-cordoba-mobile.webp y -desktop.webp, restaurar aquí los <link rel="preload"> -->
+<!-- Fondo (entrada del residencial): precarga solo la variante del viewport para no retrasar el render -->
+<link rel="preload" as="image" href="assets/fondo-cordoba-mobile.webp" media="(max-width:699px)">
+<link rel="preload" as="image" href="assets/fondo-cordoba-desktop.webp" media="(min-width:700px)">
 <style>
   :root{
     --bg:#0d0d0f; --surface:#18181b; --surface-2:#1f1f23; --line:#2a2a30;
@@ -32,14 +33,14 @@
   button{font-family:inherit;cursor:pointer;border:none}
   input,select{font-family:inherit}
 
-  /* ---------- FONDO GLOBAL (letrero Córdoba) ---------- */
+  /* ---------- FONDO GLOBAL (entrada del residencial) ---------- */
   #bgLayer{
     position:fixed;inset:0;z-index:-2;
-    /* PENDIENTE_CORDOBA_FONDO: background-image:url('assets/fondo-cordoba-mobile.webp'); */
+    background-image:url('assets/fondo-cordoba-mobile.webp');
     background-size:cover;background-position:center;background-repeat:no-repeat;
     background-color:var(--bg);   /* fallback mientras carga / si falla */
   }
-  /* PENDIENTE_CORDOBA_FONDO: @media (min-width:700px){ #bgLayer{ background-image:url('assets/fondo-cordoba-desktop.webp'); } } */
+  @media (min-width:700px){ #bgLayer{ background-image:url('assets/fondo-cordoba-desktop.webp'); } }
   /* Capa oscura sobre el fondo. LOGIN: suave (degradado, más oscuro abajo para el card).
      INTERNAS (body.in-app): ~85% para que el fondo no compita con el contenido. */
   #bgOverlay{
@@ -339,7 +340,7 @@
 </head>
 <body>
 
-<!-- Fondo global (letrero Córdoba) + capa oscura, detrás de todo -->
+<!-- Fondo global (entrada del residencial) + capa oscura, detrás de todo -->
 <div id="bgLayer"></div>
 <div id="bgOverlay"></div>
 

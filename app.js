@@ -161,7 +161,7 @@ let logoCordobaDataUrl = null;
 async function cargarLogoCordoba(){
   if (logoCordobaDataUrl) return logoCordobaDataUrl;
   try {
-    const resp = await fetch('assets/logo-cordoba.jpg');   // PENDIENTE_CORDOBA_LOGO: subir assets/logo-cordoba.jpg (662x300)
+    const resp = await fetch('assets/logo-cordoba.jpg');
     if (!resp.ok) return null;                              // sin logo: el recibo se genera sin banner
     const blob = await resp.blob();
     logoCordobaDataUrl = await new Promise((resolve, reject) => {
@@ -549,13 +549,13 @@ function fmtInviteVigencia(expira, dur){
 }
 /* Texto que acompaña al QR en Web Share / WhatsApp. `pin` es opcional (compatibilidad si
    alguna vez falta en la respuesta) — código de respaldo por si el QR no se puede escanear. */
-/* PENDIENTE_CORDOBA_LINK_COMO_LLEGAR: pegar aquí el link de Google Maps de la cerrada. */
-const LINK_COMO_LLEGAR = 'PENDIENTE_CORDOBA_LINK_COMO_LLEGAR';
+/* Link de ruta al portón de visitas (Google Maps). */
+const LINK_COMO_LLEGAR = 'https://www.google.com/maps/dir/?api=1&destination=29.121271,-111.054786';
 function buildInviteText(name, dur, uses, expira, pin){
   return `¡Hola, ${name}! 👋\n`
     + `Tienes acceso a *Cerrada Córdoba*.\n`
     + `🕐 ${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}\n`
-    + (LINK_COMO_LLEGAR.startsWith('PENDIENTE_CORDOBA') ? `\n` : `📍 Cómo llegar: ${LINK_COMO_LLEGAR}\n\n`)
+    + `📍 Cómo llegar: ${LINK_COMO_LLEGAR}\n\n`
     + `Muestra el código QR adjunto al llegar a la caseta de acceso.`
     + (pin ? `\n🔢 Código de respaldo (si el QR no funciona): ${pin}` : '');
 }
@@ -598,7 +598,7 @@ async function buildInviteCard({ payload, name, dur, uses, expira, pin }){
 
   // Fondo: foto existente escalada "cover". Si falla, color sólido.
   try {
-    const bg = await loadImage('assets/fondo-cordoba-mobile.webp');   // PENDIENTE_CORDOBA_FONDO_TARJETA (si falta: color sólido)
+    const bg = await loadImage('assets/fondo-cordoba-mobile.webp');
     const s = Math.max(W / bg.width, H / bg.height);
     const bw = bg.width * s, bh = bg.height * s;
     ctx.drawImage(bg, (W - bw) / 2, (H - bh) / 2, bw, bh);

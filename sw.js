@@ -1,7 +1,7 @@
-const CACHE = 'cordoba-v1';
+const CACHE = 'cordoba-v2';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
   './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
-  // PENDIENTE_CORDOBA_IMAGENES: al subir assets/fondo-cordoba-*.webp y assets/logo-cordoba.jpg, agregarlos aquí y subir CACHE.
+  './assets/fondo-cordoba-mobile.webp','./assets/fondo-cordoba-desktop.webp','./assets/logo-cordoba.jpg',
   './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
 
 // cache:'reload' — GitHub Pages manda Cache-Control max-age=600: con addAll(ASSETS) a secas el
