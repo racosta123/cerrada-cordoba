@@ -1,4 +1,4 @@
-const CACHE = 'cordoba-v5';
+const CACHE = 'cordoba-v6';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
   './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
   './assets/fondo-cordoba-mobile.webp','./assets/fondo-cordoba-desktop.webp','./assets/logo-cordoba.jpg',
